@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="MapFables/MapFables.csproj" />
+  <Project Path="ZZCakeBuild/CakeBuild.csproj" />
+</Solution>
