@@ -13,6 +13,7 @@ namespace MapFables
         public override void Start(ICoreAPI api)
         {
             Mod.Logger.Notification("Hello from template mod: " + api.Side);
+            //sex
         }
 
         public override void StartServerSide(ICoreServerAPI api)
