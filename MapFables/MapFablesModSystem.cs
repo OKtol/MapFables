@@ -6,7 +6,7 @@ using Vintagestory.API.Common;
 using Vintagestory.API.Config;
 using Vintagestory.API.MathTools;
 using Vintagestory.API.Server;
-using Vintagestory.GameContent; 
+using Vintagestory.GameContent; // для MapDB, FastVec2i
 
 namespace MapSharer
 {
@@ -15,7 +15,6 @@ namespace MapSharer
     {
         public string PlayerName { get; set; } = "";
         public List<ChunkCoord> ExploredChunks { get; set; } = new List<ChunkCoord>();
-        public string WorldUId { get; set; } = ""; // уникальный ID мира (SavegameIdentifier)
     }
 
     public class ChunkCoord
@@ -38,7 +37,7 @@ namespace MapSharer
             base.StartServerSide(api);
             sapi = api;
 
-            // Регистрация канала и обработчика (ретрансляция всем)
+            // Регистрация сетевого канала и обработчика (ретрансляция всем)
             var channel = api.Network.RegisterChannel("mapsharer:sharemap");
             channel.RegisterMessageType(typeof(MapDataPacket));
             channel.SetMessageHandler<MapDataPacket>((fromPlayer, packet) =>
@@ -68,7 +67,7 @@ namespace MapSharer
                         return TextCommandResult.Error("Ошибка");
                     }
 
-                    // Получаем все загруженные map-чанки
+                    // Все загруженные map-чанки
                     var allChunks = worldManager.AllLoadedMapchunks;
                     if (allChunks == null || allChunks.Count == 0)
                     {
@@ -76,7 +75,7 @@ namespace MapSharer
                         return TextCommandResult.Success();
                     }
 
-                    // Собираем координаты чанков, которые есть у игрока
+                    // Собираем координаты чанков, исследованных игроком
                     var coords = new List<ChunkCoord>();
                     foreach (var kvp in allChunks)
                     {
@@ -94,14 +93,10 @@ namespace MapSharer
                         return TextCommandResult.Success();
                     }
 
-                    // Получаем уникальный ID мира (SavegameIdentifier)
-                    string worldUId = api.World.SavegameIdentifier;
-
                     var packet = new MapDataPacket
                     {
                         PlayerName = player.PlayerName,
-                        ExploredChunks = coords,
-                        WorldUId = worldUId
+                        ExploredChunks = coords
                     };
 
                     int sent = 0;
@@ -146,8 +141,8 @@ namespace MapSharer
 
             try
             {
-                // Путь к map.db с использованием переданного WorldUId
-                string mapDbPath = GetLocalMapDbPath(packet.WorldUId);
+                // Определяем путь к map.db через SavegameIdentifier (как в игре)
+                string mapDbPath = GetLocalMapDbPath();
                 if (!System.IO.File.Exists(mapDbPath))
                 {
                     capi.ShowChatMessage($"[MapSharer] Файл карты не найден: {mapDbPath}");
@@ -156,10 +151,10 @@ namespace MapSharer
                 }
                 capi.Logger.Notification($"[MapSharer] map.db найден: {mapDbPath}");
 
-                // Используем класс MapDB из VSEssentials
+                // Работа с базой данных через MapDB
                 using (var mapDb = new MapDB(capi.Logger))
                 {
-                    string errorMsg = null;
+                    string? errorMsg = null;
                     mapDb.OpenOrCreate(mapDbPath, ref errorMsg, false, true, false);
                     if (errorMsg != null)
                     {
@@ -174,7 +169,7 @@ namespace MapSharer
                     foreach (var coord in packet.ExploredChunks)
                     {
                         FastVec2i chunkPos = new FastVec2i(coord.X, coord.Z);
-                        MapPieceDB piece = mapDb.GetMapPiece(chunkPos);
+                        MapPieceDB? piece = mapDb.GetMapPiece(chunkPos);
                         if (piece?.Pixels == null)
                         {
                             capi.Logger.Debug($"[MapSharer] Чанк ({coord.X},{coord.Z}) не найден в БД, пропускаем.");
@@ -182,7 +177,7 @@ namespace MapSharer
                         }
 
                         bool changed = false;
-                        // Пиксель 0 = неисследованный, заменяем на белый (0xFFFFFFFF)
+                        // Заменяем неисследованные пиксели (0) на белый цвет (0xFFFFFFFF)
                         for (int i = 0; i < piece.Pixels.Length; i++)
                         {
                             if (piece.Pixels[i] == 0)
@@ -200,8 +195,7 @@ namespace MapSharer
 
                     if (piecesToUpdate.Count > 0)
                     {
-                        // Сохраняем все изменённые куски карты за одну транзакцию
-                        mapDb.SetMapPieces(piecesToUpdate);
+                        mapDb.SetMapPieces(piecesToUpdate); // сохраняем за одну транзакцию
                         capi.ShowChatMessage($"[MapSharer] Сохранено {piecesToUpdate.Count} областей карты.");
                         capi.Logger.Notification($"[MapSharer] Сохранено {piecesToUpdate.Count} чанков.");
                     }
@@ -209,9 +203,9 @@ namespace MapSharer
                     {
                         capi.ShowChatMessage($"[MapSharer] Новых областей для обновления не найдено.");
                     }
-                } // using — здесь mapDb закрывается и сохраняет изменения
+                }
 
-                // Перезагружаем изменённые регионы карты, чтобы изменения отобразились на карте
+                // Обновляем отображение карты через рефлексию
                 RefreshMapRegions(packet.ExploredChunks);
                 capi.ShowChatMessage($"[MapSharer] Обновление карты завершено!");
                 capi.Logger.Notification($"[MapSharer] Карта успешно обновлена.");
@@ -224,23 +218,23 @@ namespace MapSharer
         }
 
         /// <summary>
-        /// Формирует путь к файлу map.db для данного мира.
+        /// Формирует путь к файлу map.db текущего мира, используя SavegameIdentifier.
         /// </summary>
-        private string GetLocalMapDbPath(string worldUId)
+        private string GetLocalMapDbPath()
         {
-            string dataPath = GamePaths.DataPath;
-            return System.IO.Path.Combine(dataPath, "Maps", $"{worldUId}.db");
+            string path = System.IO.Path.Combine(GamePaths.DataPath, "Maps");
+            if (!System.IO.Directory.Exists(path))
+                System.IO.Directory.CreateDirectory(path);
+            return System.IO.Path.Combine(path, capi!.World.SavegameIdentifier + ".db");
         }
 
         /// <summary>
-        /// Перезагружает регионы карты, соответствующие переданным чанкам.
-        /// Использует рефлексию для вызова приватного метода RefreshMapRegion у WorldMapManager.
+        /// Перезагружает регионы карты, соответствующие переданным чанкам, через рефлексию.
         /// </summary>
         private void RefreshMapRegions(List<ChunkCoord> chunks)
         {
             if (capi == null) return;
 
-            // Ищем WorldMapManager в клиентском API
             var worldMapManagerField = capi.GetType().GetField("worldMapManager", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
             if (worldMapManagerField == null)
             {
@@ -252,7 +246,6 @@ namespace MapSharer
             var worldMapManager = worldMapManagerField.GetValue(capi);
             if (worldMapManager == null) return;
 
-            // Ищем приватный метод RefreshMapRegion
             var refreshMethod = worldMapManager.GetType().GetMethod("RefreshMapRegion", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
             if (refreshMethod == null)
             {
@@ -261,7 +254,7 @@ namespace MapSharer
                 return;
             }
 
-            // Вычисляем уникальные координаты затронутых регионов (размер региона = 16 чанков)
+            // Координаты регионов (один регион = 16x16 чанков)
             var regions = new HashSet<FastVec2i>();
             foreach (var chunk in chunks)
             {
