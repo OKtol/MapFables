@@ -1,140 +1,288 @@
 ﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using Vintagestory.API.Client;
 using Vintagestory.API.Common;
 using Vintagestory.API.Config;
 using Vintagestory.API.MathTools;
 using Vintagestory.API.Server;
+using Vintagestory.GameContent; 
 
-namespace MapFables;
-
-public class MapSharerModSystem : ModSystem
+namespace MapSharer
 {
-    private ICoreServerAPI? serverApi;
-
-    public override void StartServerSide(ICoreServerAPI api)
+    // ===== Классы данных для сетевой передачи =====
+    public class MapDataPacket
     {
-        base.StartServerSide(api);
-        serverApi = api;
-        
-        // Регистрируем команду /sharemap
-        api.ChatCommands.Create("sharemap")
-            .WithDescription("Поделиться своей исследованной картой с другими игроками")
-            .RequiresPrivilege(Privilege.chat)
-            .HandleWith(args =>
-            {
-                // Получаем игрока, который ввёл команду
-                var player = args.Caller.Player as IServerPlayer;
-
-                if (player == null)
-                {
-                    api.Logger.Error("[MapSharer] Не удалось определить игрока, вызвавшего команду.");
-                    return TextCommandResult.Error("Не удалось определить игрока");
-                }
-
-                // Запускаем основной процесс обмена картой
-                ShareMap(api, player);
-
-                return TextCommandResult.Success("Ваша карта передаётся другим игрокам...");
-            });
-
-        api.Logger.Chat("[MapSharer][Notification] Мод успешно загружен на сервере. Команда /sharemap доступна.");
+        public string PlayerName { get; set; } = "";
+        public List<ChunkCoord> ExploredChunks { get; set; } = new List<ChunkCoord>();
+        public string WorldUId { get; set; } = ""; // уникальный ID мира (SavegameIdentifier)
     }
 
-    /// <summary>
-    /// Основная логика: перебирает все загруженные map‑чанки, проверяет, исследовал ли их источник, и отправляет их всем остальным онлайн‑игрокам.
-    /// </summary>
-    /// <param name="api"></param>
-    /// <param name="sourcePlayer"></param>
-    private static void ShareMap(ICoreServerAPI api, IServerPlayer sourcePlayer)
+    public class ChunkCoord
     {
-        // Получаем доступ к IWorldManagerAPI (через свойство WorldManager)
-        var worldManager = api.WorldManager;
-        if (worldManager == null)
+        public int X { get; set; }
+        public int Z { get; set; }
+        public ChunkCoord() { }
+        public ChunkCoord(int x, int z) { X = x; Z = z; }
+    }
+
+    // ===== Главный мод =====
+    public class MapSharerModSystem : ModSystem
+    {
+        private ICoreServerAPI? sapi;
+        private ICoreClientAPI? capi;
+
+        // ------ Серверная часть ------
+        public override void StartServerSide(ICoreServerAPI api)
         {
-            api.Logger.Chat("[MapSharer][Error] WorldManager недоступен. Операция прервана.");
-            sourcePlayer.SendMessage(GlobalConstants.GeneralChatGroup, "[MapSharer] Ошибка: менеджер мира недоступен.", EnumChatType.Notification);
-            return;
+            base.StartServerSide(api);
+            sapi = api;
+
+            // Регистрация канала и обработчика (ретрансляция всем)
+            var channel = api.Network.RegisterChannel("mapsharer:sharemap");
+            channel.RegisterMessageType(typeof(MapDataPacket));
+            channel.SetMessageHandler<MapDataPacket>((fromPlayer, packet) =>
+            {
+                if (packet?.ExploredChunks == null || packet.ExploredChunks.Count == 0) return;
+                foreach (var target in api.World.AllOnlinePlayers)
+                {
+                    if (target == fromPlayer) continue;
+                    api.Network.GetChannel("mapsharer:sharemap").SendPacket(packet, (IServerPlayer)target);
+                }
+            });
+
+            // Команда /sharemap
+            api.ChatCommands.Create("sharemap")
+                .WithDescription("Поделиться своей исследованной картой с другими игроками")
+                .RequiresPrivilege(Privilege.chat)
+                .HandleWith(args =>
+                {
+                    var player = args.Caller.Player as IServerPlayer;
+                    if (player == null)
+                        return TextCommandResult.Error("Не удалось определить игрока");
+
+                    var worldManager = api.WorldManager;
+                    if (worldManager == null)
+                    {
+                        player.SendMessage(GlobalConstants.GeneralChatGroup, "[MapSharer] WorldManager недоступен", EnumChatType.Notification);
+                        return TextCommandResult.Error("Ошибка");
+                    }
+
+                    // Получаем все загруженные map-чанки
+                    var allChunks = worldManager.AllLoadedMapchunks;
+                    if (allChunks == null || allChunks.Count == 0)
+                    {
+                        player.SendMessage(GlobalConstants.GeneralChatGroup, "[MapSharer] Нет загруженных чанков. Исследуйте мир.", EnumChatType.Notification);
+                        return TextCommandResult.Success();
+                    }
+
+                    // Собираем координаты чанков, которые есть у игрока
+                    var coords = new List<ChunkCoord>();
+                    foreach (var kvp in allChunks)
+                    {
+                        long idx = kvp.Key;
+                        Vec2i pos = worldManager.MapChunkPosFromChunkIndex2D(idx);
+                        if (pos != null && worldManager.HasChunk(pos.X, 0, pos.Y, player))
+                        {
+                            coords.Add(new ChunkCoord(pos.X, pos.Y));
+                        }
+                    }
+
+                    if (coords.Count == 0)
+                    {
+                        player.SendMessage(GlobalConstants.GeneralChatGroup, "[MapSharer] У вас нет исследованных областей для передачи.", EnumChatType.Notification);
+                        return TextCommandResult.Success();
+                    }
+
+                    // Получаем уникальный ID мира (SavegameIdentifier)
+                    string worldUId = api.World.SavegameIdentifier;
+
+                    var packet = new MapDataPacket
+                    {
+                        PlayerName = player.PlayerName,
+                        ExploredChunks = coords,
+                        WorldUId = worldUId
+                    };
+
+                    int sent = 0;
+                    foreach (var target in api.World.AllOnlinePlayers)
+                    {
+                        if (target == player) continue;
+                        api.Network.GetChannel("mapsharer:sharemap").SendPacket(packet, (IServerPlayer)target);
+                        sent++;
+                    }
+
+                    player.SendMessage(GlobalConstants.GeneralChatGroup, $"[MapSharer] Ваша карта ({coords.Count} областей) отправлена {sent} игрокам.", EnumChatType.Notification);
+                    api.Logger.Notification($"[MapSharer] {player.PlayerName} поделился {coords.Count} чанками.");
+                    return TextCommandResult.Success();
+                });
+
+            api.Logger.Notification("[MapSharer] Серверная часть загружена. Используйте /sharemap");
         }
 
-        api.Logger.Chat($"[MapSharer][Notification] Игрок {sourcePlayer.PlayerName} начал передачу своей исследованной карты.");
-
-        // 1. Получаем СЛОВАРЬ всех загруженных MAP-чанков (ключ = 2D-индекс чанка)
-        //    AllLoadedMapchunks определён в IWorldManagerAPI.
-        var allMapChunks = worldManager.AllLoadedMapchunks;
-        if (allMapChunks == null || allMapChunks.Count == 0)
+        // ------ Клиентская часть ------
+        public override void StartClientSide(ICoreClientAPI api)
         {
-            api.Logger.Chat("[MapSharer][Warning] Нет загруженных map-чанков на сервере. Возможно, игрок ещё не исследовал территорию.");
-            sourcePlayer.SendMessage(GlobalConstants.GeneralChatGroup, "[MapSharer] Нет исследованных областей для передачи.", EnumChatType.Notification);
-            return;
+            base.StartClientSide(api);
+            capi = api;
+
+            var channel = api.Network.RegisterChannel("mapsharer:sharemap");
+            channel.RegisterMessageType(typeof(MapDataPacket));
+            channel.SetMessageHandler<MapDataPacket>(OnClientReceivedMapData);
+
+            api.Logger.Notification("[MapSharer] Клиентская часть загружена.");
         }
 
-        api.Logger.Chat($"[MapSharer][Notification] Всего загружено map-чанков на сервере: {allMapChunks.Count}");
-
-        int sentChunksTotal = 0;       // Сколько чанков было отправлено хотя бы одному игроку
-        int playersOnline = api.World.AllOnlinePlayers.Length;
-
-        // Перебираем каждый загруженный map-чанк
-        foreach (var kvp in allMapChunks)
+        /// <summary>
+        /// Вызывается на клиенте при получении пакета с данными карты от сервера.
+        /// </summary>
+        private void OnClientReceivedMapData(MapDataPacket packet)
         {
-            long chunkIndex2D = kvp.Key;    // 2D-индекс чанка (кодирует X и Z)
+            if (capi == null || packet == null || packet.ExploredChunks.Count == 0)
+                return;
 
-            // Преобразуем индекс в координаты X, Z чанка
-            Vec2i chunkPos = worldManager.MapChunkPosFromChunkIndex2D(chunkIndex2D);
-            if (chunkPos == null)
+            capi.ShowChatMessage($"[MapSharer] Получена карта от {packet.PlayerName}. Обновление...");
+            capi.Logger.Notification($"[MapSharer] Начало обработки {packet.ExploredChunks.Count} чанков.");
+
+            try
             {
-                api.Logger.Chat($"[MapSharer][Warning] Не удалось получить координаты для индекса {chunkIndex2D}. Пропускаем.");
-                continue;
+                // Путь к map.db с использованием переданного WorldUId
+                string mapDbPath = GetLocalMapDbPath(packet.WorldUId);
+                if (!System.IO.File.Exists(mapDbPath))
+                {
+                    capi.ShowChatMessage($"[MapSharer] Файл карты не найден: {mapDbPath}");
+                    capi.Logger.Error($"[MapSharer] map.db отсутствует по пути {mapDbPath}");
+                    return;
+                }
+                capi.Logger.Notification($"[MapSharer] map.db найден: {mapDbPath}");
+
+                // Используем класс MapDB из VSEssentials
+                using (var mapDb = new MapDB(capi.Logger))
+                {
+                    string errorMsg = null;
+                    mapDb.OpenOrCreate(mapDbPath, ref errorMsg, false, true, false);
+                    if (errorMsg != null)
+                    {
+                        capi.ShowChatMessage($"[MapSharer] Ошибка открытия базы: {errorMsg}");
+                        capi.Logger.Error($"[MapSharer] Ошибка открытия БД: {errorMsg}");
+                        return;
+                    }
+                    capi.Logger.Notification("[MapSharer] База данных успешно открыта.");
+
+                    var piecesToUpdate = new Dictionary<FastVec2i, MapPieceDB>();
+
+                    foreach (var coord in packet.ExploredChunks)
+                    {
+                        FastVec2i chunkPos = new FastVec2i(coord.X, coord.Z);
+                        MapPieceDB piece = mapDb.GetMapPiece(chunkPos);
+                        if (piece?.Pixels == null)
+                        {
+                            capi.Logger.Debug($"[MapSharer] Чанк ({coord.X},{coord.Z}) не найден в БД, пропускаем.");
+                            continue;
+                        }
+
+                        bool changed = false;
+                        // Пиксель 0 = неисследованный, заменяем на белый (0xFFFFFFFF)
+                        for (int i = 0; i < piece.Pixels.Length; i++)
+                        {
+                            if (piece.Pixels[i] == 0)
+                            {
+                                piece.Pixels[i] = unchecked((int)0xFFFFFFFF);
+                                changed = true;
+                            }
+                        }
+
+                        if (!changed) continue;
+
+                        piecesToUpdate[chunkPos] = piece;
+                        capi.Logger.Debug($"[MapSharer] Чанк ({coord.X},{coord.Z}) подготовлен к обновлению.");
+                    }
+
+                    if (piecesToUpdate.Count > 0)
+                    {
+                        // Сохраняем все изменённые куски карты за одну транзакцию
+                        mapDb.SetMapPieces(piecesToUpdate);
+                        capi.ShowChatMessage($"[MapSharer] Сохранено {piecesToUpdate.Count} областей карты.");
+                        capi.Logger.Notification($"[MapSharer] Сохранено {piecesToUpdate.Count} чанков.");
+                    }
+                    else
+                    {
+                        capi.ShowChatMessage($"[MapSharer] Новых областей для обновления не найдено.");
+                    }
+                } // using — здесь mapDb закрывается и сохраняет изменения
+
+                // Перезагружаем изменённые регионы карты, чтобы изменения отобразились на карте
+                RefreshMapRegions(packet.ExploredChunks);
+                capi.ShowChatMessage($"[MapSharer] Обновление карты завершено!");
+                capi.Logger.Notification($"[MapSharer] Карта успешно обновлена.");
+            }
+            catch (Exception ex)
+            {
+                capi.Logger.Error($"[MapSharer] Ошибка обновления карты: {ex}");
+                capi.ShowChatMessage($"[MapSharer] Ошибка: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Формирует путь к файлу map.db для данного мира.
+        /// </summary>
+        private string GetLocalMapDbPath(string worldUId)
+        {
+            string dataPath = GamePaths.DataPath;
+            return System.IO.Path.Combine(dataPath, "Maps", $"{worldUId}.db");
+        }
+
+        /// <summary>
+        /// Перезагружает регионы карты, соответствующие переданным чанкам.
+        /// Использует рефлексию для вызова приватного метода RefreshMapRegion у WorldMapManager.
+        /// </summary>
+        private void RefreshMapRegions(List<ChunkCoord> chunks)
+        {
+            if (capi == null) return;
+
+            // Ищем WorldMapManager в клиентском API
+            var worldMapManagerField = capi.GetType().GetField("worldMapManager", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            if (worldMapManagerField == null)
+            {
+                capi.Logger.Warning("[MapSharer] Не удалось найти WorldMapManager. Карта может не обновиться.");
+                capi.ShowChatMessage("[MapSharer] Не удалось обновить отображение карты, но данные сохранены.");
+                return;
             }
 
-            int chunkX = chunkPos.X;
-            int chunkZ = chunkPos.Y;
+            var worldMapManager = worldMapManagerField.GetValue(capi);
+            if (worldMapManager == null) return;
 
-            // 2. Проверяем: исследовал ли ИСТОЧНИК (sourcePlayer) этот map-чанк?
-            //    HasChunk(chunkX, chunkY, chunkZ, player) – есть ли у игрока данный чанк.
-            //    Для map-чанка Y всегда 0 (map-чанки не имеют вертикальной координаты).
-            bool sourceHasChunk = worldManager.HasChunk(chunkX, 0, chunkZ, sourcePlayer);
-
-            if (!sourceHasChunk)
+            // Ищем приватный метод RefreshMapRegion
+            var refreshMethod = worldMapManager.GetType().GetMethod("RefreshMapRegion", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            if (refreshMethod == null)
             {
-                // Этот чанк не открыт у источника – пропускаем
-                api.Logger.Chat($"[MapSharer][Debug] Игрок {sourcePlayer.PlayerName} не исследовал чанк ({chunkX}, {chunkZ}).");
-                continue;
+                capi.Logger.Warning("[MapSharer] Метод RefreshMapRegion не найден. Карта может не обновиться.");
+                capi.ShowChatMessage("[MapSharer] Не удалось обновить отображение карты, но данные сохранены.");
+                return;
             }
 
-            api.Logger.Chat($"[MapSharer][Debug] Чанк ({chunkX}, {chunkZ}) исследован {sourcePlayer.PlayerName}. Начинаем рассылку.");
-
-            // 3. Отправляем этот map-чанк всем ОСТАЛЬНЫМ онлайн-игрокам
-            int sentToTargets = 0;
-            foreach (var targetPlayer in api.World.AllOnlinePlayers)
+            // Вычисляем уникальные координаты затронутых регионов (размер региона = 16 чанков)
+            var regions = new HashSet<FastVec2i>();
+            foreach (var chunk in chunks)
             {
-                if (targetPlayer == sourcePlayer) continue; // себе не отправляем
+                int regionX = chunk.X / 16;
+                int regionZ = chunk.Z / 16;
+                regions.Add(new FastVec2i(regionX, regionZ));
+            }
 
+            capi.Logger.Notification($"[MapSharer] Обновление {regions.Count} регионов карты.");
+            foreach (var region in regions)
+            {
                 try
                 {
-                    // Используем метод ResendMapChunk из IWorldManagerAPI.
-                    // Он отправляет map-чанк указанному игроку (или всем, если передать null).
-                    // В документации: void ResendMapChunk(int chunkX, int chunkZ, bool onlyIfInRange, IServerPlayer player = null)
-                    // Параметр onlyIfInRange = false – отправляем всегда, даже если игрок далеко.
-                    // Третий параметр – конкретный игрок.
-                    worldManager.ResendMapChunk(chunkX, chunkZ, false);
-                    sentToTargets++;
-                    sentChunksTotal++;
-
-                    api.Logger.Chat($"[MapSharer][Debug] Чанк ({chunkX}, {chunkZ}) отправлен игроку {targetPlayer.PlayerName}");
+                    refreshMethod.Invoke(worldMapManager, new object[] { region });
+                    capi.Logger.Debug($"[MapSharer] Обновлён регион ({region.X}, {region.Y})");
                 }
                 catch (Exception ex)
                 {
-                    api.Logger.Chat($"[MapSharer][Error] Ошибка отправки чанка ({chunkX}, {chunkZ}) игроку {targetPlayer.PlayerName}: {ex.Message}");
+                    capi.Logger.Error($"[MapSharer] Ошибка обновления региона ({region.X},{region.Y}): {ex.Message}");
                 }
             }
-
-            if (sentToTargets > 0)
-            {
-                api.Logger.Chat($"[MapSharer][Notification] Чанк ({chunkX}, {chunkZ}) отправлен {sentToTargets} из {playersOnline - 1} другим игрокам.");
-            }
         }
-
-        // Финальное уведомление
-        api.Logger.Chat($"[MapSharer][Notification] Передача карты от {sourcePlayer.PlayerName} завершена. Всего отправлено уникальных map-чанков: {sentChunksTotal}");
-        sourcePlayer.SendMessage(GlobalConstants.GeneralChatGroup, $"[MapSharer] Ваша карта передана ({sentChunksTotal} областей).", EnumChatType.Notification);
     }
 }
