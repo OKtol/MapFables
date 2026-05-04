@@ -6,21 +6,14 @@ namespace MapFables;
 [ProtoContract(ImplicitFields = ImplicitFields.AllPublic)]
 public class MapDataPacket
 {
-    public string PlayerName { get; set; } = "";
-    public List<ChunkCoord> ExploredChunks { get; set; } = new();
+    public string SenderName { get; set; } = "";
+    public List<ChunkImageData> Chunks { get; set; } = new();
 }
 
 [ProtoContract(ImplicitFields = ImplicitFields.AllPublic)]
-public class ShareMapRequest
-{
-    // Пустой пакет-запрос
-}
-
-[ProtoContract(ImplicitFields = ImplicitFields.AllPublic)]
-public class ChunkCoord
+public class ChunkImageData
 {
     public int X { get; set; }
     public int Z { get; set; }
-    public ChunkCoord() { }
-    public ChunkCoord(int x, int z) { X = x; Z = z; }
+    public int[] Pixels { get; set; } = new int[0];
 }

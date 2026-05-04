@@ -11,8 +11,7 @@ public class MapFablesModSystem : ModSystem
     {
         base.Start(api);
         api.Network.RegisterChannel(NetworkChannelName)
-            .RegisterMessageType(typeof(MapDataPacket))
-            .RegisterMessageType(typeof(ShareMapRequest));    // новый тип
+            .RegisterMessageType<MapDataPacket>();
 
         var harmony = new Harmony(Mod.Info.ModID);
         harmony.PatchAll();
