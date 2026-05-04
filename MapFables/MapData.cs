@@ -4,17 +4,16 @@ using System.Collections.Generic;
 namespace MapFables;
 
 [ProtoContract(ImplicitFields = ImplicitFields.AllPublic)]
-public class MapDataRequest
+public class MapDataPacket
 {
     public string PlayerName { get; set; } = "";
-    public List<ChunkCoord> ExploredChunks { get; set; } = new List<ChunkCoord>();
+    public List<ChunkCoord> ExploredChunks { get; set; } = new();
 }
 
 [ProtoContract(ImplicitFields = ImplicitFields.AllPublic)]
-public class MapDataResponce
+public class ShareMapRequest
 {
-    public string PlayerName { get; set; } = "";
-    public List<ChunkCoord> ExploredChunks { get; set; } = new List<ChunkCoord>();
+    // Пустой пакет-запрос
 }
 
 [ProtoContract(ImplicitFields = ImplicitFields.AllPublic)]

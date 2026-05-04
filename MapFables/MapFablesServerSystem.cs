@@ -1,109 +1,60 @@
-﻿using System.Collections.Generic;
-using Vintagestory.API.Common;
+﻿using Vintagestory.API.Common;
 using Vintagestory.API.Config;
-using Vintagestory.API.MathTools;
 using Vintagestory.API.Server;
 
 namespace MapFables;
 
 internal class MapFablesServerSystem : ModSystem
 {
-    IServerNetworkChannel serverChannel = null!;
-    ICoreServerAPI sapi = null!;
+    private IServerNetworkChannel serverChannel = null!;
+    private ICoreServerAPI sapi = null!;
 
-    /// <summary>
-    /// This is a server-side system, so we do not want it to load on the client.
-    /// </summary>
-    public override bool ShouldLoad(EnumAppSide forSide)
-    {
-        return forSide != EnumAppSide.Client;
-    }
+    public override bool ShouldLoad(EnumAppSide forSide) => forSide == EnumAppSide.Server;
 
     public override void StartServerSide(ICoreServerAPI api)
     {
         base.StartServerSide(api);
-
-        serverChannel = api.Network.GetChannel(Mod.Info.ModID + ".networkchannel")
-            .SetMessageHandler<MapDataResponce>(OnMapDataRequestReceived);
         sapi = api;
 
+        serverChannel = api.Network.GetChannel(MapFablesModSystem.NetworkChannelName);
+        serverChannel.SetMessageHandler<MapDataPacket>(OnMapDataReceived);
+
+        // Регистрируем серверную команду
         api.ChatCommands.Create("sharemap")
-            .WithDescription("Поделиться своей исследованной картой с другими игроками")
+            .WithDescription("Share your discovered chunks with all online players")
             .RequiresPlayer()
             .RequiresPrivilege(Privilege.chat)
-            .HandleWith(OnShareMapCmd);
+            .HandleWith(OnShareMapCommand);
 
-        api.Logger.Notification("[MapFables] Серверная часть загружена. Используйте /sharemap");
+        api.Logger.Notification("[MapFables] Server-side loaded with /sharemap command.");
     }
 
-    private void OnMapDataRequestReceived(IServerPlayer fromPlayer, MapDataResponce packet)
-    {
-        if (packet?.ExploredChunks == null || packet.ExploredChunks.Count == 0) return;
-        var responce = new MapDataRequest
-        {
-            PlayerName = packet.PlayerName,
-            ExploredChunks = packet.ExploredChunks
-        };
-        foreach (var target in sapi.World.AllOnlinePlayers)
-        {
-            if (target == fromPlayer) continue;
-            serverChannel.SendPacket(responce, (IServerPlayer)target);
-        }
-    }
-
-    private TextCommandResult OnShareMapCmd(TextCommandCallingArgs args)
+    // Когда игрок вводит /sharemap, просим у него данные
+    private TextCommandResult OnShareMapCommand(TextCommandCallingArgs args)
     {
         var player = args.Caller.Player as IServerPlayer;
+        if (player == null) return TextCommandResult.Error("Player not found");
 
-        var worldManager = sapi.WorldManager;
-        if (worldManager == null)
-        {
-            player!.SendMessage(GlobalConstants.GeneralChatGroup, "[MapFables] WorldManager недоступен", EnumChatType.Notification);
-            return TextCommandResult.Error("Ошибка");
-        }
-
-        // Все загруженные map-чанки
-        var allChunks = worldManager.AllLoadedMapchunks;
-        if (allChunks == null || allChunks.Count == 0)
-        {
-            player!.SendMessage(GlobalConstants.GeneralChatGroup, "[MapFables] Нет загруженных чанков. Исследуйте мир.", EnumChatType.Notification);
-            return TextCommandResult.Success();
-        }
-
-        // Собираем координаты чанков, исследованных игроком
-        var coords = new List<ChunkCoord>();
-        foreach (var kvp in allChunks)
-        {
-            long idx = kvp.Key;
-            Vec2i pos = worldManager.MapChunkPosFromChunkIndex2D(idx);
-            if (pos != null && worldManager.HasChunk(pos.X, 0, pos.Y, player))
-            {
-                coords.Add(new ChunkCoord(pos.X, pos.Y));
-            }
-        }
-
-        if (coords.Count == 0)
-        {
-            player!.SendMessage(GlobalConstants.GeneralChatGroup, "[MapFables] У вас нет исследованных областей для передачи.", EnumChatType.Notification);
-            return TextCommandResult.Success();
-        }
-
-        var packet = new MapDataRequest
-        {
-            PlayerName = player!.PlayerName,
-            ExploredChunks = coords
-        };
-
-        int sent = 0;
-        foreach (var target in sapi.World.AllOnlinePlayers)
-        {
-            if (target == player) continue;
-            serverChannel.SendPacket(packet, (IServerPlayer)target);
-            sent++;
-        }
-
-        player.SendMessage(GlobalConstants.GeneralChatGroup, $"[MapFables] Ваша карта ({coords.Count} областей) отправлена {sent} игрокам.", EnumChatType.Notification);
-        sapi.Logger.Notification($"[MapFables] {player.PlayerName} поделился {coords.Count} чанками.");
+        // Отправляем клиенту запрос на предоставление его чанков
+        serverChannel.SendPacket(new ShareMapRequest(), player);
+        player.SendMessage(GlobalConstants.GeneralChatGroup, "[MapFables] Gathering your discovered chunks...", EnumChatType.Notification);
         return TextCommandResult.Success();
+    }
+
+    // Получили пакет с чанками от игрока – рассылаем всем остальным
+    private void OnMapDataReceived(IServerPlayer fromPlayer, MapDataPacket packet)
+    {
+        if (packet?.ExploredChunks == null || packet.ExploredChunks.Count == 0)
+            return;
+
+        // Отправляем пакет всем онлайн-игрокам, кроме отправителя
+        foreach (IServerPlayer target in sapi.World.AllOnlinePlayers)
+        {
+            if (target == fromPlayer) continue;
+            serverChannel.SendPacket(packet, target);
+        }
+
+        // Лог на сервере
+        sapi.Logger.Notification($"[MapFables] {fromPlayer.PlayerName} shared {packet.ExploredChunks.Count} chunks.");
     }
 }
