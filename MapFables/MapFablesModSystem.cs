@@ -1,34 +1,27 @@
-using HarmonyLib;
 using Vintagestory.API.Common;
+using Vintagestory.GameContent;
 
 namespace MapFables;
 
+/// <summary>
+/// Точка входа мода. Регистрирует MapFablesChunkLayer в реестре слоёв карты
+/// ДО того как WorldMapManager создаёт экземпляры слоёв в OnLvlFinalize.
+///
+/// Порядок: WorldMapManager.Start() регистрирует дефолтные слои,
+/// наш Start() вызывается следом и добавляет свой слой в тот же реестр.
+/// При LevelFinalize движок создаёт все слои через Activator.CreateInstance.
+/// </summary>
 public class MapFablesModSystem : ModSystem
 {
-    public const string NetworkChannelName = "mapfables.networkchannel";
-
-    private Harmony? harmony;
+    public const string MapLayerCode = "mapfables_chunks";
 
     public override void Start(ICoreAPI api)
     {
         base.Start(api);
 
-        api.Network
-            .RegisterChannel(NetworkChannelName)
-            .RegisterMessageType<MapDataPacket>();
+        var wmm = api.ModLoader.GetModSystem<WorldMapManager>();
+        wmm.RegisterMapLayer<MapFablesChunkLayer>(MapLayerCode, 0.05);
 
-        // Патчим только на клиенте — патч работает с клиентским рендером карты
-        if (api.Side == EnumAppSide.Client)
-        {
-            harmony = new Harmony(Mod.Info.ModID);
-            harmony.PatchAll();
-            api.Logger.Notification("[MapFables] Harmony patches applied.");
-        }
-    }
-
-    public override void Dispose()
-    {
-        harmony?.UnpatchAll(Mod.Info.ModID);
-        base.Dispose();
+        api.Logger.Notification("[MapFables] Registered MapFablesChunkLayer.");
     }
 }

@@ -11,13 +11,17 @@ using Vintagestory.GameContent;
 
 namespace MapFables;
 
+/// <summary>
+/// Серверная система. Читает локальную mapdb сервера и отправляет пиксели
+/// целевым игрокам через встроенный механизм движка SendMapDataToClient,
+/// который доставит данные в MapFablesChunkLayer.OnDataFromServer.
+/// </summary>
 internal class MapFablesServerSystem : ModSystem
 {
-    private IServerNetworkChannel serverChannel = null!;
     private ICoreServerAPI sapi = null!;
+    private WorldMapManager wmm = null!;
 
-    // Максимальное количество чанков в одном пакете.
-    // Разбиваем на батчи, чтобы не перегрузить сеть/память.
+    // Максимум чанков в одном пакете
     private const int BatchSize = 200;
 
     public override bool ShouldLoad(EnumAppSide forSide) => forSide == EnumAppSide.Server;
@@ -26,18 +30,16 @@ internal class MapFablesServerSystem : ModSystem
     {
         base.StartServerSide(api);
         sapi = api;
-
-        serverChannel = api.Network.GetChannel(MapFablesModSystem.NetworkChannelName);
+        wmm = api.ModLoader.GetModSystem<WorldMapManager>();
 
         api.ChatCommands
             .Create("sharemap")
-            .WithDescription("Поделиться всеми чанками карты из базы данных со всеми онлайн-игроками")
+            .WithDescription("Поделиться своей картой со всеми онлайн-игроками")
             .RequiresPlayer()
-            // controlserver — только администратор может делиться картой
-            .RequiresPrivilege(Privilege.controlserver)
+            .RequiresPrivilege(Privilege.chat)
             .HandleWith(OnShareMapCommand);
 
-        api.Logger.Notification("[MapFables] Server-side loaded. Use /sharemap to share map data.");
+        api.Logger.Notification("[MapFables] Server-side loaded. Use /sharemap to share map.");
     }
 
     private List<(int x, int z, int[] pixels)> GetAllMapPieces()
@@ -45,8 +47,7 @@ internal class MapFablesServerSystem : ModSystem
         var result = new List<(int, int, int[])>();
 
         string savegameId = sapi.WorldManager.SaveGame.SavegameIdentifier;
-        string mapsFolder = Path.Combine(GamePaths.DataPath, "Maps");
-        string mapDbPath = Path.Combine(mapsFolder, savegameId + ".db");
+        string mapDbPath = Path.Combine(GamePaths.DataPath, "Maps", savegameId + ".db");
 
         if (!File.Exists(mapDbPath))
         {
@@ -60,16 +61,12 @@ internal class MapFablesServerSystem : ModSystem
             conn.Open();
 
             using var cmd = conn.CreateCommand();
-
-            // Сначала проверяем количество записей
             cmd.CommandText = "SELECT COUNT(*) FROM mappiece";
             long rowCount = (long)cmd.ExecuteScalar()!;
             sapi.Logger.Notification("[MapFables] mappiece table contains {0} rows", rowCount);
 
-            if (rowCount == 0)
-                return result;
+            if (rowCount == 0) return result;
 
-            // Читаем все записи
             cmd.CommandText = "SELECT position, data FROM mappiece";
             using var reader = cmd.ExecuteReader();
 
@@ -79,16 +76,15 @@ internal class MapFablesServerSystem : ModSystem
                 byte[] blob = (byte[])reader[1];
 
                 var piece = SerializerUtil.Deserialize<MapPieceDB>(blob);
-                if (piece?.Pixels == null || piece.Pixels.Length == 0)
-                    continue;
+                if (piece?.Pixels == null || piece.Pixels.Length == 0) continue;
 
-                // Позиция кодируется как: pos = (x << 32) | (z & 0xFFFFFFFF)
+                // pos = (x << 32) | (z & 0xFFFFFFFF)
                 int x = (int)(pos >> 32);
                 int z = (int)(pos & 0xFFFFFFFF);
                 result.Add((x, z, piece.Pixels));
             }
 
-            sapi.Logger.Notification("[MapFables] Loaded {0} map chunks from DB", result.Count);
+            sapi.Logger.Notification("[MapFables] Loaded {0} chunks from mapdb", result.Count);
         }
         catch (Exception ex)
         {
@@ -101,48 +97,62 @@ internal class MapFablesServerSystem : ModSystem
     private TextCommandResult OnShareMapCommand(TextCommandCallingArgs args)
     {
         var caller = args.Caller.Player as IServerPlayer;
-        if (caller == null)
-            return TextCommandResult.Error("Player not found");
+        if (caller == null) return TextCommandResult.Error("Player not found");
 
-        // Получаем список онлайн-игроков заранее (до async),
-        // чтобы не обращаться к API из другого потока
+        // Собираем список получателей заранее — до Task.Run
         var targets = new List<IServerPlayer>();
         foreach (IServerPlayer p in sapi.World.AllOnlinePlayers)
         {
-            if (p != caller)
-                targets.Add(p);
+            if (p != caller) targets.Add(p);
         }
 
         if (targets.Count == 0)
-        {
             return TextCommandResult.Success("[MapFables] Нет других игроков онлайн.");
-        }
 
-        caller.SendMessage(
-            GlobalConstants.GeneralChatGroup,
+        caller.SendMessage(GlobalConstants.GeneralChatGroup,
             "[MapFables] Читаю данные карты, подождите...",
             EnumChatType.Notification);
 
-        // Выносим чтение БД в фоновый поток, чтобы не блокировать сервер
+        // Чтение БД в фоновом потоке — не блокируем сервер
         Task.Run(() =>
         {
             var allPieces = GetAllMapPieces();
 
             if (allPieces.Count == 0)
             {
-                // Возвращаемся в главный поток для отправки сообщения
                 sapi.Event.EnqueueMainThreadTask(() =>
-                {
-                    caller.SendMessage(
-                        GlobalConstants.GeneralChatGroup,
+                    caller.SendMessage(GlobalConstants.GeneralChatGroup,
                         "[MapFables] База данных карты пуста.",
-                        EnumChatType.Notification);
-                }, "mapfables_notify");
+                        EnumChatType.Notification),
+                    "mapfables_empty");
                 return;
             }
 
-            // Разбиваем на батчи и отправляем
+            // Находим наш слой карты в WorldMapManager
+            // Слой должен быть зарегистрирован — MapFablesModSystem делает это в Start()
+            MapLayer? ourLayer = null;
+            sapi.Event.EnqueueMainThreadTask(() =>
+            {
+                ourLayer = wmm.MapLayers.Find(l => l is MapFablesChunkLayer);
+            }, "mapfables_findlayer");
+
+            // Небольшая пауза чтобы EnqueueMainThreadTask выполнился
+            // прежде чем мы начнём отправлять батчи
+            System.Threading.Thread.Sleep(50);
+
+            if (ourLayer == null)
+            {
+                sapi.Logger.Error("[MapFables] MapFablesChunkLayer not found in MapLayers!");
+                sapi.Event.EnqueueMainThreadTask(() =>
+                    caller.SendMessage(GlobalConstants.GeneralChatGroup,
+                        "[MapFables] Ошибка: слой карты не найден.",
+                        EnumChatType.Notification),
+                    "mapfables_error");
+                return;
+            }
+
             int totalSent = 0;
+
             for (int i = 0; i < allPieces.Count; i += BatchSize)
             {
                 int end = Math.Min(i + BatchSize, allPieces.Count);
@@ -160,33 +170,36 @@ internal class MapFablesServerSystem : ModSystem
                     Chunks = batchChunks
                 };
 
-                int batchIndex = i; // capture for lambda
-                // Отправка пакетов должна происходить из главного потока
+                byte[] data = SerializerUtil.Serialize(packet);
+
+                // Отправка через официальный канал движка —
+                // попадёт в MapFablesChunkLayer.OnDataFromServer у каждого получателя
+                var capturedLayer = ourLayer;
+                int capturedBatch = i;
                 sapi.Event.EnqueueMainThreadTask(() =>
                 {
                     foreach (var target in targets)
                     {
-                        serverChannel.SendPacket(packet, target);
+                        wmm.SendMapDataToClient(capturedLayer, target, data);
                     }
                     sapi.Logger.Notification(
-                        $"[MapFables] Sent batch starting at {batchIndex}, " +
-                        $"size {packet.Chunks.Count} to {targets.Count} player(s)");
+                        "[MapFables] Sent batch at {0}, size {1} to {2} player(s)",
+                        capturedBatch, batchChunks.Count, targets.Count);
                 }, "mapfables_send");
 
                 totalSent += batchChunks.Count;
             }
 
             int capturedTotal = totalSent;
-            int capturedTargets = targets.Count;
+            int capturedCount = targets.Count;
             sapi.Event.EnqueueMainThreadTask(() =>
             {
-                caller.SendMessage(
-                    GlobalConstants.GeneralChatGroup,
-                    $"[MapFables] Отправлено {capturedTotal} чанков {capturedTargets} игрок(ам).",
+                caller.SendMessage(GlobalConstants.GeneralChatGroup,
+                    $"[MapFables] Отправлено {capturedTotal} чанков {capturedCount} игрок(ам).",
                     EnumChatType.Notification);
                 sapi.Logger.Notification(
-                    $"[MapFables] {caller.PlayerName} shared {capturedTotal} chunks " +
-                    $"to {capturedTargets} players.");
+                    "[MapFables] {0} shared {1} chunks to {2} players.",
+                    caller.PlayerName, capturedTotal, capturedCount);
             }, "mapfables_done");
         });
 

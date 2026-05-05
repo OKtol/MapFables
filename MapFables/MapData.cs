@@ -3,6 +3,10 @@ using System.Collections.Generic;
 
 namespace MapFables;
 
+/// <summary>
+/// Пакет с данными карты. Сериализуется через Protobuf и передаётся
+/// через механизм движка SendMapDataToClient -> OnDataFromServer.
+/// </summary>
 [ProtoContract]
 public class MapDataPacket
 {
