@@ -1,135 +1,131 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Reflection;
+using System.Linq;
+using Vintagestory.API.Client;
 using Vintagestory.API.Common;
+using Vintagestory.API.Config;
 using Vintagestory.API.MathTools;
-using Vintagestory.API.Util;
 using Vintagestory.GameContent;
 
 namespace MapFables;
 
-/// <summary>
-/// Клиентский слой карты, который принимает пиксели чанков от других игроков
-/// и записывает их в локальную mapdb. Движок сам отрисует их через
-/// стандартный путь: mapdb.GetMapPiece -> loadFromChunkPixels -> GPU.
-///
-/// Наследуется от ChunkMapLayer чтобы иметь прямой доступ к mapdb и chunksToGen.
-/// Транспорт — встроенный механизм движка: SendMapDataToClient / OnDataFromServer.
-/// </summary>
-public class MapFablesChunkLayer : ChunkMapLayer
+public class MapFablesChunkLayer : MapLayer
 {
-    // Кэшируем поля через рефлексию один раз при первом вызове OnDataFromServer.
-    // Нужно потому что mapdb, chunksToGen и chunksToGenLock объявлены
-    // как private в ChunkMapLayer — напрямую не доступны из наследника.
-    private static FieldInfo? s_mapdbField;
-    private static FieldInfo? s_chunksToGenField;
-    private static FieldInfo? s_chunksToGenLockField;
-    private static MethodInfo? s_enqueueMethod;
-    private static bool s_fieldsResolved;
+    public override string Title => "MapFables Shared";
+    public override string LayerGroupCode => "mapfableschunk";
+    public override EnumMapAppSide DataSide => EnumMapAppSide.Client;
 
-    public MapFablesChunkLayer(ICoreAPI api, IWorldMapManager mapSink)
-        : base(api, mapSink)
+    private ConcurrentDictionary<(int x, int z), byte[]> pendingPixels = new();
+    private ConcurrentDictionary<(int x, int z), LoadedTexture> chunkTextures = new();
+    private ConcurrentDictionary<(int x, int z), float> chunkTTL = new();
+    private const float TTL_MAX = float.MaxValue;
+
+    private ICoreClientAPI? capi;
+    private bool firstFrame = true;
+    private Vec2f tmpViewPos = new();
+    private Vec3d tmpWorldPos = new();
+
+    public MapFablesChunkLayer(ICoreAPI api, IWorldMapManager mapSink) : base(api, mapSink)
     {
+        capi = api as ICoreClientAPI;
     }
 
-    /// <summary>
-    /// Вызывается движком когда сервер отправил данные через SendMapDataToClient.
-    /// Десериализуем пакет, пишем пиксели в mapdb и добавляем чанки в очередь.
-    /// </summary>
-    public override void OnDataFromServer(byte[] data)
+    public override void OnDataFromServer(byte[] data) { }
+
+    public override void OnMapOpenedClient()
     {
-        if (data == null || data.Length == 0) return;
-
-        MapDataPacket packet;
-        try
-        {
-            packet = SerializerUtil.Deserialize<MapDataPacket>(data);
-        }
-        catch (Exception ex)
-        {
-            api.Logger.Warning("[MapFables] Failed to deserialize map packet: {0}", ex.Message);
-            return;
-        }
-
-        if (packet?.Chunks == null || packet.Chunks.Count == 0) return;
-
-        if (!ResolveFields()) return;
-
-        var mapdb = s_mapdbField!.GetValue(this) as MapDB;
-        var chunksToGen = s_chunksToGenField!.GetValue(this);
-        var chunksToGenLock = s_chunksToGenLockField!.GetValue(this);
-
-        if (mapdb == null)
-        {
-            api.Logger.Warning("[MapFables] mapdb is null, cannot inject chunks.");
-            return;
-        }
-
-        // Формируем словарь для пакетной записи в SQLite
-        var piecesToSave = new Dictionary<FastVec2i, MapPieceDB>();
-        foreach (var chunk in packet.Chunks)
-        {
-            if (chunk.Pixels == null || chunk.Pixels.Length == 0) continue;
-            piecesToSave[new FastVec2i(chunk.X, chunk.Z)] = new MapPieceDB { Pixels = chunk.Pixels };
-        }
-
-        if (piecesToSave.Count == 0) return;
-
-        // Записываем в локальную SQLite БД клиента одной транзакцией
-        try
-        {
-            mapdb.SetMapPieces(piecesToSave);
-        }
-        catch (Exception ex)
-        {
-            api.Logger.Warning("[MapFables] Failed to write chunks to mapdb: {0}", ex.Message);
-            return;
-        }
-
-        // Добавляем чанки в очередь на генерацию —
-        // OnOffThreadTick подхватит их и вызовет loadFromChunkPixels
-        lock (chunksToGenLock!)
-        {
-            foreach (var cord in piecesToSave.Keys)
-                s_enqueueMethod!.Invoke(chunksToGen, new object[] { cord });
-        }
-
-        api.Logger.Notification(
-            "[MapFables] Injected {0} chunks from {1} into mapdb.",
-            piecesToSave.Count, packet.SenderName);
-
-        (api as Vintagestory.API.Client.ICoreClientAPI)?
-            .ShowChatMessage($"[MapFables] Получено {piecesToSave.Count} чанков карты от {packet.SenderName}. Открой карту чтобы увидеть их.");
+        api.Logger.Notification("[MapFables] Map opened. Resetting TTL for all {0} loaded chunks.", chunkTextures.Count);
+        foreach (var key in chunkTextures.Keys)
+            chunkTTL[key] = TTL_MAX;
     }
 
-    private bool ResolveFields()
+    public override void Render(GuiElementMap map, float dt)
     {
-        if (s_fieldsResolved) return s_mapdbField != null;
-        s_fieldsResolved = true;
+        if (!Active || capi == null) return;
 
-        var flags = BindingFlags.NonPublic | BindingFlags.Instance;
-        var t = typeof(ChunkMapLayer);
+        // ОТЛАДКА: красная заливка, чтобы убедиться, что слой жив
+        capi.Render.RenderRectangle(
+            (float)map.Bounds.renderX,
+            (float)map.Bounds.renderY,
+            (float)map.Bounds.OuterWidth,
+            (float)map.Bounds.OuterHeight,
+            50f,
+            ColorUtil.ColorFromRgba(150, 255, 0, 0)
+        );
 
-        s_mapdbField         = t.GetField("mapdb",            flags);
-        s_chunksToGenField   = t.GetField("chunksToGen",      flags);
-        s_chunksToGenLockField = t.GetField("chunksToGenLock", flags);
-
-        if (s_chunksToGenField != null)
-            s_enqueueMethod = s_chunksToGenField
-                .FieldType
-                .GetMethod("Enqueue");
-
-        if (s_mapdbField == null || s_chunksToGenField == null ||
-            s_chunksToGenLockField == null || s_enqueueMethod == null)
+        // Перенос пикселей из общей очереди
+        while (MapFablesModSystem.ReceivedPixels.TryDequeue(out var item))
         {
-            api.Logger.Warning(
-                "[MapFables] Could not resolve ChunkMapLayer private fields. " +
-                "mapdb={0} chunksToGen={1} lock={2} enqueue={3}",
-                s_mapdbField != null, s_chunksToGenField != null,
-                s_chunksToGenLockField != null, s_enqueueMethod != null);
-            return false;
+            pendingPixels.TryAdd((item.x, item.z), item.pixels);
         }
 
-        return true;
+        // Создание текстур
+        if (!pendingPixels.IsEmpty)
+        {
+            int createdThisFrame = 0;
+            var keys = pendingPixels.Keys.ToArray();
+            foreach (var key in keys)
+            {
+                if (pendingPixels.TryRemove(key, out byte[]? pixels) && pixels != null)
+                {
+                    int[] rgbaPixels = new int[pixels.Length];
+                    Buffer.BlockCopy(pixels, 0, rgbaPixels, 0, pixels.Length);
+
+                    LoadedTexture tex = new LoadedTexture(capi, 0, GlobalConstants.ChunkSize, GlobalConstants.ChunkSize);
+                    capi.Render.LoadOrUpdateTextureFromRgba(rgbaPixels, false, 0, ref tex);
+                    chunkTextures[key] = tex;
+                    chunkTTL[key] = TTL_MAX;
+                    createdThisFrame++;
+                }
+            }
+            if (createdThisFrame > 0)
+                api.Logger.Notification("[MapFables] Created {0} textures this frame. Total textures: {1}.", createdThisFrame, chunkTextures.Count);
+        }
+
+        int renderedThisFrame = 0;
+        float zoom = map.ZoomLevel;
+
+        foreach (var kv in chunkTextures)
+        {
+            var key = kv.Key;
+            chunkTTL[key] = TTL_MAX;
+
+            tmpWorldPos.Set(key.x * GlobalConstants.ChunkSize, 0, key.z * GlobalConstants.ChunkSize);
+            map.TranslateWorldPosToViewPos(tmpWorldPos, ref tmpViewPos);
+
+            capi.Render.Render2DTexture(
+                kv.Value.TextureId,
+                (int)(map.Bounds.renderX + tmpViewPos.X),
+                (int)(map.Bounds.renderY + tmpViewPos.Y),
+                (int)(GlobalConstants.ChunkSize * zoom),
+                (int)(GlobalConstants.ChunkSize * zoom),
+                50f
+            );
+            renderedThisFrame++;
+
+            if (firstFrame)
+            {
+                api.Logger.Notification("[MapFables] First chunk ({0},{1}) viewPos=({2:F1},{3:F1}), screen=({4:F1},{5:F1}), zoom={6}, mapBounds=({7},{8})-({9},{10})",
+                    key.x, key.z, tmpViewPos.X, tmpViewPos.Y,
+                    map.Bounds.renderX + tmpViewPos.X, map.Bounds.renderY + tmpViewPos.Y,
+                    zoom,
+                    map.Bounds.renderX, map.Bounds.renderY,
+                    map.Bounds.renderX + map.Bounds.OuterWidth, map.Bounds.renderY + map.Bounds.OuterHeight);
+                firstFrame = false;
+            }
+        }
+
+        if (renderedThisFrame > 0)
+            api.Logger.VerboseDebug("[MapFables] Rendered {0} chunks.", renderedThisFrame);
+    }
+
+    public override void Dispose()
+    {
+        api.Logger.Notification("[MapFables] Disposing layer. Textures: {0}, Pending: {1}.", chunkTextures.Count, pendingPixels.Count);
+        foreach (var tex in chunkTextures.Values) tex.Dispose();
+        chunkTextures.Clear();
+        pendingPixels.Clear();
+        base.Dispose();
     }
 }

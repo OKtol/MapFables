@@ -1,39 +1,43 @@
 <Project Sdk="Microsoft.NET.Sdk">
+	<PropertyGroup>
+		<TargetFramework>net8.0</TargetFramework>
+		<Nullable>enable</Nullable>
+		<LangVersion>latest</LangVersion>
+		<AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+		<OutputPath>bin/$(Configuration)</OutputPath>
+		<PublishDir>bin/$(Configuration)/Mods/mod/publish/</PublishDir>
+		<CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+	</PropertyGroup>
 
-  <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
-    <Nullable>enable</Nullable>
-    <LangVersion>latest</LangVersion>
-    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
-    <OutputPath>bin/$(Configuration)</OutputPath>
-    <!-- CakeBuild ищет результат здесь -->
-    <PublishDir>bin/$(Configuration)/Mods/mod/publish/</PublishDir>
-    <!-- Не тащим зависимости игры в publish -->
-    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
-  </PropertyGroup>
+	<PropertyGroup>
+		<GameDir Condition="'$(VINTAGE_STORY)' != ''">$(VINTAGE_STORY)</GameDir>
+		<GameDir Condition="'$(GameDir)' == ''">C:\Users\$(USERNAME)\AppData\Roaming\VintagestoryData</GameDir>
+	</PropertyGroup>
 
-  <PropertyGroup>
-    <GameDir Condition="'$(VINTAGE_STORY)' != ''">$(VINTAGE_STORY)</GameDir>
-    <GameDir Condition="'$(GameDir)' == ''">C:\Users\$(USERNAME)\AppData\Roaming\VintagestoryData</GameDir>
-  </PropertyGroup>
-
-  <ItemGroup>
-    <Reference Include="VintagestoryAPI">
-      <HintPath>$(GameDir)\VintagestoryAPI.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="VSEssentials">
-      <HintPath>$(GameDir)\Mods\VSEssentials.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="Microsoft.Data.Sqlite">
-      <HintPath>$(GameDir)\Lib\Microsoft.Data.Sqlite.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="protobuf-net">
-      <HintPath>$(GameDir)\Lib\protobuf-net.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-  </ItemGroup>
-
+	<ItemGroup>
+		<Reference Include="VintagestoryAPI">
+			<HintPath>$(GameDir)\VintagestoryAPI.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
+		<Reference Include="VSEssentials">
+			<HintPath>$(GameDir)\Mods\VSEssentials.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
+		<Reference Include="VSSurvivalMod">
+			<HintPath>$(GameDir)\Mods\VSSurvivalMod.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
+		<Reference Include="0Harmony">
+			<HintPath>$(GameDir)\Lib\0Harmony.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
+		<Reference Include="Microsoft.Data.Sqlite">
+			<HintPath>$(GameDir)\Lib\Microsoft.Data.Sqlite.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
+		<Reference Include="protobuf-net">
+			<HintPath>$(GameDir)\Lib\protobuf-net.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
+	</ItemGroup>
 </Project>
