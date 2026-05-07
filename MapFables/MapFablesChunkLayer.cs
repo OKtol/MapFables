@@ -1,7 +1,5 @@
-using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Linq;
 using Vintagestory.API.Client;
 using Vintagestory.API.Common;
 using Vintagestory.API.Config;
@@ -16,85 +14,86 @@ public class MapFablesChunkLayer : MapLayer
     public override string LayerGroupCode => "mapfableschunk";
     public override EnumMapAppSide DataSide => EnumMapAppSide.Client;
 
-    private ConcurrentDictionary<(int x, int z), LoadedTexture> chunkTextures = new();
-    private ConcurrentDictionary<(int x, int z), float> chunkTTL = new();
-    private const float TTL_MAX = float.MaxValue; // текстуры живут вечно при открытой карте
+    private readonly ConcurrentDictionary<(int x, int z), LoadedTexture> chunkTextures = new();
+    private readonly ConcurrentDictionary<(int x, int z), float> chunkTTL = new();
+    private const float TTL_MAX = 300f;
 
     private ICoreClientAPI? capi;
     private Vec2f tmpViewPos = new();
     private Vec3d tmpWorldPos = new();
-    private int renderedCountLog = 0;
 
     public MapFablesChunkLayer(ICoreAPI api, IWorldMapManager mapSink) : base(api, mapSink)
     {
         capi = api as ICoreClientAPI;
+        api.Logger.Notification("[MapFables] ChunkLayer constructor called");
     }
 
-    public override void OnDataFromServer(byte[] data) { }
-
-    public override void OnMapOpenedClient()
+    public override void OnLoaded()
     {
-        api.Logger.Notification("[MapFables] Map opened. Resetting TTL for all {0} loaded chunks.", chunkTextures.Count);
-        foreach (var key in chunkTextures.Keys)
-            chunkTTL[key] = TTL_MAX;
+        base.OnLoaded();
+        api.Logger.Notification("[MapFables] ChunkLayer OnLoaded");
     }
 
     public override void Render(GuiElementMap map, float dt)
     {
+        // Отладка: вызывается ли Render и сколько данных в очереди
+        api.Logger.VerboseDebug("[MapFables] Render called, queue size: {0}, textures: {1}",
+            MapFablesModSystem.ReceivedPixels.Count, chunkTextures.Count);
+
         if (!Active || capi == null) return;
 
-        // Переносим пиксели из очереди и сразу создаём/обновляем текстуры
-        int newChunks = 0, updatedChunks = 0;
+        // --- Загрузка текстур из очереди ---
+        int newCount = 0;
+        int debugCreated = 0; // счётчик для отладки первых 5 чанков
         while (MapFablesModSystem.ReceivedPixels.TryDequeue(out var item))
         {
-            byte[] pixels = item.pixels;
-            int[] rgbaPixels = new int[pixels.Length];
-            Buffer.BlockCopy(pixels, 0, rgbaPixels, 0, pixels.Length);
+            var key = (item.x, item.z);
 
-            LoadedTexture tex;
-            if (chunkTextures.TryGetValue((item.x, item.z), out tex))
+            // Удаляем старую текстуру, если есть
+            if (chunkTextures.TryRemove(key, out var oldTex))
+                oldTex.Dispose();
+
+            // Создаём новую текстуру
+            var tex = new LoadedTexture(capi, 0, GlobalConstants.ChunkSize, GlobalConstants.ChunkSize);
+            capi.Render.LoadOrUpdateTextureFromRgba(item.pixels, false, 0, ref tex);
+            chunkTextures[key] = tex;
+            chunkTTL[key] = TTL_MAX;
+
+            // Отладка: выводим координаты первых 5 чанков
+            if (debugCreated < 5)
             {
-                // Обновляем существующую текстуру
-                capi.Render.LoadOrUpdateTextureFromRgba(rgbaPixels, false, tex.TextureId, ref tex);
-                updatedChunks++;
+                capi.Logger.Notification("[MapFables] Creating texture for chunk ({0},{1})", item.x, item.z);
+                debugCreated++;
             }
-            else
-            {
-                // Создаём новую
-                tex = new LoadedTexture(capi, 0, GlobalConstants.ChunkSize, GlobalConstants.ChunkSize);
-                capi.Render.LoadOrUpdateTextureFromRgba(rgbaPixels, false, 0, ref tex);
-                chunkTextures[(item.x, item.z)] = tex;
-                newChunks++;
-            }
-            chunkTTL[(item.x, item.z)] = TTL_MAX;
+
+            newCount++;
         }
 
-        if (newChunks > 0 || updatedChunks > 0)
-            api.Logger.Notification("[MapFables] Processed queue: created {0}, updated {1} textures. Total loaded: {2}.",
-                newChunks, updatedChunks, chunkTextures.Count);
+        if (newCount > 0)
+            api.Logger.Notification("[MapFables] Textures created: {0}, total: {1}", newCount, chunkTextures.Count);
 
-        // Текущий рендер и обслуживание TTL
-        List<(int x, int z)> toRemove = new();
-        int renderedThisFrame = 0;
+        // --- Рендеринг всех активных текстур ---
         float zoom = map.ZoomLevel;
-
+        bool debugPosPrinted = false;
         foreach (var kv in chunkTextures)
         {
-            var key = kv.Key;
-            if (chunkTTL.TryGetValue(key, out float ttl))
-            {
-                ttl -= dt;
-                if (ttl <= 0)
-                {
-                    kv.Value.Dispose();
-                    toRemove.Add(key);
-                    continue;
-                }
-                chunkTTL[key] = ttl;
-            }
+            if (kv.Value.Disposed) continue;
 
-            tmpWorldPos.Set(key.x * GlobalConstants.ChunkSize, 0, key.z * GlobalConstants.ChunkSize);
+            var key = kv.Key;
+            tmpWorldPos.Set(
+                key.x * GlobalConstants.ChunkSize,
+                0,
+                key.z * GlobalConstants.ChunkSize);
             map.TranslateWorldPosToViewPos(tmpWorldPos, ref tmpViewPos);
+
+            // Отладка: выводим мировые и экранные координаты первого чанка
+            if (!debugPosPrinted)
+            {
+                capi.Logger.Notification("[MapFables] Render: world ({0},{1}) -> view ({2},{3}) bounds renderX {4} renderY {5} zoom {6}",
+                    tmpWorldPos.X, tmpWorldPos.Z, tmpViewPos.X, tmpViewPos.Y,
+                    map.Bounds.renderX, map.Bounds.renderY, zoom);
+                debugPosPrinted = true;
+            }
 
             capi.Render.Render2DTexture(
                 kv.Value.TextureId,
@@ -102,29 +101,32 @@ public class MapFablesChunkLayer : MapLayer
                 (int)(map.Bounds.renderY + tmpViewPos.Y),
                 (int)(GlobalConstants.ChunkSize * zoom),
                 (int)(GlobalConstants.ChunkSize * zoom),
-                50f
+                50f  // Z-depth: поверх terrain (ChunkMapLayer рендерится на 50 тоже)
             );
-            renderedThisFrame++;
         }
+    }
 
+    public override void OnTick(float dt)
+    {
+        var toRemove = new List<(int x, int z)>();
+        foreach (var kv in chunkTTL)
+        {
+            float ttl = kv.Value - dt;
+            if (ttl <= 0) toRemove.Add(kv.Key);
+            else chunkTTL[kv.Key] = ttl;
+        }
         foreach (var key in toRemove)
         {
-            chunkTextures.TryRemove(key, out _);
+            if (chunkTextures.TryRemove(key, out var tex))
+                tex.Dispose();
             chunkTTL.TryRemove(key, out _);
-        }
-
-        // Периодическое логирование рендера
-        if (renderedThisFrame != renderedCountLog)
-        {
-            api.Logger.VerboseDebug("[MapFables] Rendered {0} chunks. Total loaded: {1}.", renderedThisFrame, chunkTextures.Count);
-            renderedCountLog = renderedThisFrame;
         }
     }
 
     public override void Dispose()
     {
-        api.Logger.Notification("[MapFables] Disposing layer. Textures: {0}.", chunkTextures.Count);
-        foreach (var tex in chunkTextures.Values) tex.Dispose();
+        foreach (var tex in chunkTextures.Values)
+            if (!tex.Disposed) tex.Dispose();
         chunkTextures.Clear();
         chunkTTL.Clear();
         base.Dispose();

@@ -8,6 +8,7 @@ namespace MapFables
     {
         [ProtoMember(1)]
         public string FromPlayer = "";
+
         [ProtoMember(2)]
         public List<ChunkImageData> Chunks = new List<ChunkImageData>();
     }
@@ -17,13 +18,12 @@ namespace MapFables
     {
         [ProtoMember(1)]
         public int X;
+
         [ProtoMember(2)]
         public int Z;
+
+        /// <summary>Пиксели чанка (32×32) в формате int[] (игровой формат).</summary>
         [ProtoMember(3)]
-        public byte[] Pixels = System.Array.Empty<byte>();
-        [ProtoMember(4)]
-        public int Width;
-        [ProtoMember(5)]
-        public int Height;
+        public int[] Pixels = System.Array.Empty<int>();
     }
 }
