@@ -67,7 +67,6 @@ namespace MapFables
             }
             if (added > 0 && capi != null)
             {
-                capi.ShowChatMessage($"[MapFables] Получено {added} чанков от {packet.FromPlayer}. Откройте карту (M).");
                 capi.Logger.Notification("[MapFables] Client received {0} chunks from {1}.", added, packet.FromPlayer);
             }
         }
@@ -108,7 +107,6 @@ namespace MapFables
 
                 var chunks = new List<(int X, int Z, byte[]? Pixels)>();
                 using var cmd = connection.CreateCommand();
-                // Правильный запрос к таблице mappiece
                 cmd.CommandText = "SELECT position, data FROM mappiece";
                 using var reader = cmd.ExecuteReader();
                 while (reader.Read())
