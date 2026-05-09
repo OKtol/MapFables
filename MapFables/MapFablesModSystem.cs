@@ -140,8 +140,7 @@ namespace MapFables
             while (reader.Read())
             {
                 long pos = reader.GetInt64(0);
-                int cx = (int)(pos >> 27);
-                int cz = unchecked((int)(uint)(pos & 0xFFFFFFFF));
+                var decodedPos = DecodePosition(pos);
 
                 if (reader.IsDBNull(1)) continue;
 
@@ -152,23 +151,30 @@ namespace MapFables
                     if (piece?.Pixels != null && piece.Pixels.Length == GlobalConstants.ChunkSize * GlobalConstants.ChunkSize)
                         chunks.Add(new ChunkImageData 
                         { 
-                            X = cx,
-                            Z = cz, 
+                            X = decodedPos.x,
+                            Z = decodedPos.z, 
                             Pixels = piece.Pixels 
-                        }); // piece.Pixels уже int[]
+                        });
                 }
                 catch (Exception ex)
                 {
-                    sapi!.Logger.Warning("[MapFables] Failed to deserialize chunk ({0},{1}): {2}", cx, cz, ex.Message);
+                    sapi!.Logger.Warning("[MapFables] Failed to deserialize chunk ({0},{1}): {2}", decodedPos.x, decodedPos.z, ex.Message);
                 }
                 if (debugCounter3 < 5)
                 {
                     sapi!.Logger.Notification("[MapFables] Chunk {0}: ({1},{2}) world pos ({3},{4})",
-                        debugCounter3, cx, cz, cx * GlobalConstants.ChunkSize, cz * GlobalConstants.ChunkSize);
+                        debugCounter3, decodedPos.x, decodedPos.z, decodedPos.x * GlobalConstants.ChunkSize, decodedPos.z * GlobalConstants.ChunkSize);
                     debugCounter3++;
                 }
             }
             return chunks;
+        }
+
+        private static (int x, int z) DecodePosition(long position)
+        {
+            int x = (int)(position & 0x7FFFFFF);              // Lower 27 bits = X
+            int z = (int)((position >> 27) & 0x7FFFFFF);      // Bits 27-53 = Z (Y in FastVec2i)
+            return (x, z);
         }
 
         private bool TryGetMapDbPath(IServerPlayer sender, out string mapDbPath)
