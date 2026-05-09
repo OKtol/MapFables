@@ -1,14 +1,13 @@
+using Microsoft.Data.Sqlite;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
-using System.Threading.Tasks;
-using Microsoft.Data.Sqlite;
-using ProtoBuf;
+using System.Linq;
 using Vintagestory.API.Client;
 using Vintagestory.API.Common;
-using Vintagestory.API.Server;
 using Vintagestory.API.Config;
+using Vintagestory.API.Server;
 using Vintagestory.API.Util;
 using Vintagestory.GameContent;
 
@@ -18,51 +17,48 @@ namespace MapFables
     {
         private ICoreServerAPI? sapi;
         private ICoreClientAPI? capi;
-        private IServerNetworkChannel? channel;
+
+        private string channelName = string.Empty;
 
         /// <summary>Очередь пикселей для клиентского слоя (главный поток).</summary>
-        internal static readonly ConcurrentQueue<(int x, int z, int[] pixels)> ReceivedPixels = new();
+        public static ConcurrentQueue<ChunkImageData> ReceivedPixels { get; set; } = new();
 
         public override void Start(ICoreAPI api)
         {
+            channelName = Mod.Info.ModID + ".network";
+
+            api.Network
+                .RegisterChannel(channelName)
+                .RegisterMessageType<MapDataPacket>();
+
+            var wmm = api.ModLoader.GetModSystem<WorldMapManager>();
+            wmm.RegisterMapLayer<MapFablesChunkLayer>("mapfableschunk", 1.0);
+
             api.Logger.Notification("[MapFables] Mod system loaded.");
         }
 
         public override void StartServerSide(ICoreServerAPI api)
         {
-            try
-            {
-                sapi = api;
+            sapi = api;
 
-                // Регистрируем клиентский слой, чтобы он знал о нашем канале
-                var wmm = api.ModLoader.GetModSystem<WorldMapManager>();
-                wmm.RegisterMapLayer<MapFablesChunkLayer>("mapfableschunk", 1.0);
-
-                channel = api.Network.RegisterChannel("mapfables")
-                    .RegisterMessageType<MapDataPacket>();
-
-                api.ChatCommands
+            sapi.ChatCommands
                 .Create("sharemap")
                 .WithDescription("Share your explored map with other players")
                 .RequiresPrivilege(Privilege.chat)
                 .HandleWith(OnShareMapCommand);
-            }
-            catch (Exception ex)
-            {
-                api.Logger.Error("[MapFables] Failed to start server side: {0}", ex);
-            }
+
+            sapi.Logger.Notification("[MapFables] Server layer registered.");
         }
 
         public override void StartClientSide(ICoreClientAPI api)
         {
             capi = api;
-            var clientChannel = api.Network.RegisterChannel("mapfables")
-                .RegisterMessageType<MapDataPacket>();
-            clientChannel.SetMessageHandler<MapDataPacket>(OnClientPacket);
-            var wmm = api.ModLoader.GetModSystem<WorldMapManager>();
-            wmm.RegisterMapLayer<MapFablesChunkLayer>("mapfableschunk", 1.0);
 
-            api.Logger.Notification("[MapFables] Client layer registered.");
+            capi.Network
+                .GetChannel(channelName)
+                .SetMessageHandler<MapDataPacket>(OnClientPacket);
+
+            capi.Logger.Notification("[MapFables] Client layer registered.");
         }
         
 
@@ -76,7 +72,7 @@ namespace MapFables
                 // Проверяем размер (1024 пикселя для 32×32)
                 if (chunk.Pixels == null || chunk.Pixels.Length != GlobalConstants.ChunkSize * GlobalConstants.ChunkSize)
                     continue;
-                ReceivedPixels.Enqueue((chunk.X, chunk.Z, chunk.Pixels));
+                ReceivedPixels.Enqueue(chunk);
                 added++;
             }
 
@@ -89,100 +85,38 @@ namespace MapFables
 
         private TextCommandResult OnShareMapCommand(TextCommandCallingArgs args)
         {
-            var player = args.Caller.Player as IServerPlayer;
-            if (player == null)
+            if (args.Caller.Player is not IServerPlayer player)
                 return TextCommandResult.Error("Only players can use this command.");
 
-            Task.Run(() => ShareMapAsync(player));
+            ShareMap(player);
             return TextCommandResult.Success("Sharing map...");
         }
 
-        private void ShareMapAsync(IServerPlayer sender)
+        private void ShareMap(IServerPlayer sender)
         {
-            if (sapi == null) return;
+            var channel = sapi!.Network.GetChannel(channelName)!;
+
             try
             {
-                string? saveId = sapi.WorldManager.SaveGame?.SavegameIdentifier;
-                if (string.IsNullOrEmpty(saveId))
-                {
-                    sender.SendMessage(GlobalConstants.GeneralChatGroup, "Savegame not identified.", EnumChatType.Notification);
+                if (!TryGetMapDbPath(sender, out string mapDbPath))
                     return;
-                }
 
-                string mapDbPath = Path.Combine(GamePaths.DataPath, "Maps", saveId + ".db");
-                if (!File.Exists(mapDbPath))
-                {
-                    sender.SendMessage(GlobalConstants.GeneralChatGroup, $"Map database not found at {mapDbPath}", EnumChatType.Notification);
-                    return;
-                }
+                var pieces = LoadMapPiecesFromDb(mapDbPath);
 
-                using var connection = new SqliteConnection($"Data Source={mapDbPath};Mode=ReadOnly");
-                connection.Open();
+                sapi.Logger.Notification("[MapFables] Read {0} valid chunks from DB.", pieces.Count);
 
-                var chunks = new List<(int X, int Z, int[] Pixels)>();
-                using var cmd = connection.CreateCommand();
-                cmd.CommandText = "SELECT position, data FROM mappiece";
-                using var reader = cmd.ExecuteReader();
-                int debugCounter3 = 0;
-                while (reader.Read())
-                {
-                    long pos = reader.GetInt64(0);
-                    int cx = (int)(pos >> 27);
-                    int cz = unchecked((int)(uint)(pos & 0xFFFFFFFF));
-
-                    if (reader.IsDBNull(1)) continue;
-
-                    byte[] blob = (byte[])reader[1];
-                    try
+                var chunks = Enumerable.Chunk(pieces, 20)
+                    .Select(x => new MapDataPacket
                     {
-                        var piece = SerializerUtil.Deserialize<MapPieceDB>(blob);
-                        if (piece?.Pixels != null && piece.Pixels.Length == GlobalConstants.ChunkSize * GlobalConstants.ChunkSize)
-                        {
-                            chunks.Add((cx, cz, piece.Pixels)); // piece.Pixels уже int[]
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        sapi.Logger.Warning("[MapFables] Failed to deserialize chunk ({0},{1}): {2}", cx, cz, ex.Message);
-                    }
-                    if (debugCounter3 < 5)
-                    {
-                        sapi.Logger.Notification("[MapFables] Chunk {0}: ({1},{2}) world pos ({3},{4})",
-           debugCounter3, cx, cz, cx * GlobalConstants.ChunkSize, cz * GlobalConstants.ChunkSize);
-                        debugCounter3++;
-                    }
-                }
+                        FromPlayer = sender.PlayerName,
+                        Chunks = [.. x]
+                    });
 
-                sapi.Logger.Notification("[MapFables] Read {0} valid chunks from DB.", chunks.Count);
-
-                // Рассылаем пакетами по 20 чанков
-                int sentCount = 0;
-                var batch = new MapDataPacket
-                {
-                    FromPlayer = sender.PlayerName,
-                    Chunks = new List<ChunkImageData>()
-                };
-
-                foreach (var (x, z, pixels) in chunks)
-                {
-                    batch.Chunks.Add(new ChunkImageData { X = x, Z = z, Pixels = pixels });
-
-                    if (batch.Chunks.Count >= 20)
-                    {
-                        SendBatch(batch);
-                        sentCount += batch.Chunks.Count;
-                        batch.Chunks.Clear();
-                        System.Threading.Thread.Sleep(50);
-                    }
-                }
-                if (batch.Chunks.Count > 0)
-                {
-                    SendBatch(batch);
-                    sentCount += batch.Chunks.Count;
-                }
+                foreach (var packet in chunks)
+                    channel.BroadcastPacket(packet);
 
                 sender.SendMessage(GlobalConstants.GeneralChatGroup,
-                    $"Shared {sentCount} map chunks with everyone.", EnumChatType.Notification);
+                    $"Shared {pieces.Count} map chunks with everyone.", EnumChatType.Notification);
             }
             catch (Exception ex)
             {
@@ -191,13 +125,70 @@ namespace MapFables
             }
         }
 
-        private void SendBatch(MapDataPacket batch)
+        private List<ChunkImageData> LoadMapPiecesFromDb(string mapDbPath)
         {
-            // Отправка всем онлайн игрокам (потенциально не потокобезопасно, но работает в большинстве случаев)
-            foreach (var player in sapi!.World.AllOnlinePlayers)
+            var chunks = new List<ChunkImageData>();
+
+            var connection = new SqliteConnection($"Data Source={mapDbPath};Mode=ReadOnly");
+            connection.Open();
+
+            var cmd = connection.CreateCommand();
+            cmd.CommandText = "SELECT position, data FROM mappiece";
+
+            var reader = cmd.ExecuteReader();
+            int debugCounter3 = 0;
+            while (reader.Read())
             {
-                channel?.SendPacket(batch, player as IServerPlayer);
+                long pos = reader.GetInt64(0);
+                int cx = (int)(pos >> 27);
+                int cz = unchecked((int)(uint)(pos & 0xFFFFFFFF));
+
+                if (reader.IsDBNull(1)) continue;
+
+                byte[] blob = (byte[])reader[1];
+                try
+                {
+                    var piece = SerializerUtil.Deserialize<MapPieceDB>(blob);
+                    if (piece?.Pixels != null && piece.Pixels.Length == GlobalConstants.ChunkSize * GlobalConstants.ChunkSize)
+                        chunks.Add(new ChunkImageData 
+                        { 
+                            X = cx,
+                            Z = cz, 
+                            Pixels = piece.Pixels 
+                        }); // piece.Pixels уже int[]
+                }
+                catch (Exception ex)
+                {
+                    sapi!.Logger.Warning("[MapFables] Failed to deserialize chunk ({0},{1}): {2}", cx, cz, ex.Message);
+                }
+                if (debugCounter3 < 5)
+                {
+                    sapi!.Logger.Notification("[MapFables] Chunk {0}: ({1},{2}) world pos ({3},{4})",
+                        debugCounter3, cx, cz, cx * GlobalConstants.ChunkSize, cz * GlobalConstants.ChunkSize);
+                    debugCounter3++;
+                }
             }
+            return chunks;
+        }
+
+        private bool TryGetMapDbPath(IServerPlayer sender, out string mapDbPath)
+        {
+            string? saveId = sapi!.WorldManager.SaveGame?.SavegameIdentifier;
+            if (string.IsNullOrEmpty(saveId))
+            {
+                sender.SendMessage(GlobalConstants.GeneralChatGroup, "Savegame not identified.", EnumChatType.Notification);
+                mapDbPath = string.Empty;
+                return false;
+            }
+
+            mapDbPath = Path.Combine(GamePaths.DataPath, "Maps", saveId + ".db");
+            if (!File.Exists(mapDbPath))
+            {
+                sender.SendMessage(GlobalConstants.GeneralChatGroup, $"Map database not found at {mapDbPath}", EnumChatType.Notification);
+                return false;
+            }
+
+            return true;
         }
     }
 }
