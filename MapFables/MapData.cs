@@ -22,7 +22,7 @@ namespace MapFables
         [ProtoMember(2)]
         public int Z;
 
-        /// <summary>Пиксели чанка (32×32) в формате int[] (игровой формат).</summary>
+        // Пиксели чанка (32×32 = 1024 int) в формате RGBA
         [ProtoMember(3)]
         public int[] Pixels = System.Array.Empty<int>();
     }

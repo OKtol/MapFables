@@ -1,134 +1,115 @@
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using Vintagestory.API.Client;
 using Vintagestory.API.Common;
-using Vintagestory.API.Config;
 using Vintagestory.API.MathTools;
 using Vintagestory.GameContent;
 
-namespace MapFables;
-
-public class MapFablesChunkLayer : MapLayer
+namespace MapFables
 {
-    public override string Title => "MapFables Shared";
-    public override string LayerGroupCode => "mapfableschunk";
-    public override EnumMapAppSide DataSide => EnumMapAppSide.Client;
-
-    private readonly ConcurrentDictionary<(int x, int z), LoadedTexture> chunkTextures = new();
-    private readonly ConcurrentDictionary<(int x, int z), float> chunkTTL = new();
-    private const float TTL_MAX = 300f;
-
-    private ICoreClientAPI? capi;
-    private Vec2f tmpViewPos = new();
-    private Vec3d tmpWorldPos = new();
-
-    public MapFablesChunkLayer(ICoreAPI api, IWorldMapManager mapSink) : base(api, mapSink)
+    /// <summary>
+    /// Кастомный слой карты для отображения чанков, полученных от другого игрока.
+    ///
+    /// Используем MultiChunkMapComponent — тот же класс, что и стандартный ChunkMapLayer.
+    /// Он группирует чанки по 3×3 и рендерит их через фреймбуфер в одну текстуру,
+    /// что правильно обрабатывает мировые координаты и масштаб карты.
+    ///
+    /// Данные хранятся только в памяти — не сохраняются в MapDB.
+    /// </summary>
+    public class MapFablesChunkLayer : MapLayer
     {
-        capi = api as ICoreClientAPI;
-        api.Logger.Notification("[MapFables] ChunkLayer constructor called");
-    }
+        public override string Title => "MapFables Shared";
+        public override string LayerGroupCode => "mapfableschunk";
+        public override EnumMapAppSide DataSide => EnumMapAppSide.Client;
 
-    public override void OnLoaded()
-    {
-        base.OnLoaded();
-        api.Logger.Notification("[MapFables] ChunkLayer OnLoaded");
-    }
+        // Словарь: координата MultiChunkMapComponent (в единицах групп 3×3) → компонент
+        private readonly Dictionary<FastVec2i, MultiChunkMapComponent> sharedMapData = new();
 
-    public override void Render(GuiElementMap map, float dt)
-    {
-        // Отладка: вызывается ли Render и сколько данных в очереди
-        api.Logger.VerboseDebug("[MapFables] Render called, queue size: {0}, textures: {1}",
-            MapFablesModSystem.ReceivedPixels.Count, chunkTextures.Count);
+        private ICoreClientAPI? capi;
 
-        if (!Active || capi == null) return;
-
-        // --- Загрузка текстур из очереди ---
-        int newCount = 0;
-        int debugCreated = 0; // счётчик для отладки первых 5 чанков
-        while (MapFablesModSystem.ReceivedPixels.TryDequeue(out var item))
+        public MapFablesChunkLayer(ICoreAPI api, IWorldMapManager mapSink) : base(api, mapSink)
         {
-            var key = (item.x, item.z);
+            capi = api as ICoreClientAPI;
+            api.Logger.Notification("[MapFables] ChunkLayer constructor called");
+        }
 
-            // Удаляем старую текстуру, если есть
-            if (chunkTextures.TryRemove(key, out var oldTex))
-                oldTex.Dispose();
+        public override void OnLoaded()
+        {
+            base.OnLoaded();
+            api.Logger.Notification("[MapFables] ChunkLayer OnLoaded");
+        }
 
-            // Создаём новую текстуру
-            var tex = new LoadedTexture(capi, 0, GlobalConstants.ChunkSize, GlobalConstants.ChunkSize);
-            capi.Render.LoadOrUpdateTextureFromRgba(item.pixels, false, 0, ref tex);
-            chunkTextures[key] = tex;
-            chunkTTL[key] = TTL_MAX;
+        /// <summary>
+        /// Вызывается на главном потоке каждые ~20мс через WorldMapManager.OnClientTick().
+        /// Здесь безопасно создавать OpenGL текстуры.
+        /// Забираем пиксели из статической очереди и загружаем в MultiChunkMapComponent.
+        /// </summary>
+        public override void OnTick(float dt)
+        {
+            if (MapFablesModSystem.ReceivedPixels.IsEmpty) return;
 
-            // Отладка: выводим координаты первых 5 чанков
-            if (debugCreated < 5)
+            // Обрабатываем не более 50 чанков за тик, чтобы не фризить игру
+            int toProcess = System.Math.Min(MapFablesModSystem.ReceivedPixels.Count, 50);
+            var modified = new List<MultiChunkMapComponent>();
+
+            while (toProcess-- > 0 && MapFablesModSystem.ReceivedPixels.TryDequeue(out var item))
             {
-                capi.Logger.Notification("[MapFables] Creating texture for chunk ({0},{1})", item.x, item.z);
-                debugCreated++;
+                // MultiChunkMapComponent группирует чанки по сетке ChunkLen×ChunkLen (3×3).
+                // mcCoord — координата группы, baseCoord — координата первого чанка в группе.
+                var mcCoord = new FastVec2i(
+                    item.x / MultiChunkMapComponent.ChunkLen,
+                    item.z / MultiChunkMapComponent.ChunkLen);
+                var baseCoord = new FastVec2i(
+                    mcCoord.X * MultiChunkMapComponent.ChunkLen,
+                    mcCoord.Y * MultiChunkMapComponent.ChunkLen);
+
+                if (!sharedMapData.TryGetValue(mcCoord, out var comp))
+                {
+                    // Создаём новый компонент для этой группы 3×3
+                    // baseCoord передаётся в блочных координатах внутри конструктора:
+                    // worldPos = baseCoord * chunkSize
+                    comp = new MultiChunkMapComponent(capi!, baseCoord);
+                    sharedMapData[mcCoord] = comp;
+                }
+
+                // dx/dz — смещение чанка внутри группы 3×3 (0, 1 или 2)
+                int dx = item.x - baseCoord.X;
+                int dz = item.z - baseCoord.Y;
+
+                comp.setChunk(dx, dz, item.pixels);
+                modified.Add(comp);
             }
 
-            newCount++;
-        }
-
-        if (newCount > 0)
-            api.Logger.Notification("[MapFables] Textures created: {0}, total: {1}", newCount, chunkTextures.Count);
-
-        // --- Рендеринг всех активных текстур ---
-        float zoom = map.ZoomLevel;
-        bool debugPosPrinted = false;
-        foreach (var kv in chunkTextures)
-        {
-            if (kv.Value.Disposed) continue;
-
-            var key = kv.Key;
-            tmpWorldPos.Set(
-                key.x * GlobalConstants.ChunkSize,
-                0,
-                key.z * GlobalConstants.ChunkSize);
-            map.TranslateWorldPosToViewPos(tmpWorldPos, ref tmpViewPos);
-
-            // Отладка: выводим мировые и экранные координаты первого чанка
-            if (!debugPosPrinted)
+            // Загружаем пиксели в GPU-текстуру через фреймбуфер
+            foreach (var comp in modified)
             {
-                capi.Logger.Notification("[MapFables] Render: world ({0},{1}) -> view ({2},{3}) bounds renderX {4} renderY {5} zoom {6}",
-                    tmpWorldPos.X, tmpWorldPos.Z, tmpViewPos.X, tmpViewPos.Y,
-                    map.Bounds.renderX, map.Bounds.renderY, zoom);
-                debugPosPrinted = true;
+                comp.FinishSetChunks();
             }
-
-            capi.Render.Render2DTexture(
-                kv.Value.TextureId,
-                (int)(map.Bounds.renderX + tmpViewPos.X),
-                (int)(map.Bounds.renderY + tmpViewPos.Y),
-                (int)(GlobalConstants.ChunkSize * zoom),
-                (int)(GlobalConstants.ChunkSize * zoom),
-                50f  // Z-depth: поверх terrain (ChunkMapLayer рендерится на 50 тоже)
-            );
         }
-    }
 
-    public override void OnTick(float dt)
-    {
-        var toRemove = new List<(int x, int z)>();
-        foreach (var kv in chunkTTL)
+        /// <summary>
+        /// Рендерит все полученные чанки на карте.
+        /// Вызывается каждый кадр из GuiElementMap.RenderInteractiveElements().
+        /// MultiChunkMapComponent сам вычисляет экранные координаты через
+        /// map.TranslateWorldPosToViewPos() — поэтому масштаб и позиция всегда корректны.
+        /// </summary>
+        public override void Render(GuiElementMap map, float dt)
         {
-            float ttl = kv.Value - dt;
-            if (ttl <= 0) toRemove.Add(kv.Key);
-            else chunkTTL[kv.Key] = ttl;
-        }
-        foreach (var key in toRemove)
-        {
-            if (chunkTextures.TryRemove(key, out var tex))
-                tex.Dispose();
-            chunkTTL.TryRemove(key, out _);
-        }
-    }
+            if (!Active || capi == null) return;
 
-    public override void Dispose()
-    {
-        foreach (var tex in chunkTextures.Values)
-            if (!tex.Disposed) tex.Dispose();
-        chunkTextures.Clear();
-        chunkTTL.Clear();
-        base.Dispose();
+            foreach (var val in sharedMapData)
+            {
+                val.Value.Render(map, dt);
+            }
+        }
+
+        public override void Dispose()
+        {
+            foreach (var val in sharedMapData)
+            {
+                val.Value?.ActuallyDispose();
+            }
+            sharedMapData.Clear();
+            base.Dispose();
+        }
     }
 }
